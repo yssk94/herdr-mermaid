@@ -4,8 +4,7 @@ Claude Code mod that draws the mermaid diagrams in Claude's replies as images, i
 their code blocks. The picture is part of the transcript: it scrolls, wraps and clips with the
 text around it, in herdr panes and in a plain Ghostty or kitty window alike.
 
-## Requirements
-1960
+## Requirementsaaa
 | Requirement                                                                                     | Why                                                                                                             |
 | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | A terminal with kitty graphics: Ghostty, kitty 0.28+, or herdr 0.9.2+ attached from one of them | Claude Code draws the picture with kitty graphics unicode placeholders                                          |
