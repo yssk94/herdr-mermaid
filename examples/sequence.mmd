@@ -1,0 +1,18 @@
+sequenceDiagram
+  autonumber
+  actor User
+  participant Claude as Claude Code
+  participant Emit as herdr-mermaid emit
+  participant Daemon as herdr-mermaid daemon
+  participant Herdr as herdr
+
+  User->>Claude: ask for a diagram
+  Claude->>Emit: diagram source (.mmd)
+  Emit-->>Claude: padded mermaid block
+  Claude->>User: message ending with the block
+  Daemon->>Daemon: tail the transcript, render with Chrome
+  loop every 50 ms
+    Daemon->>Herdr: pane.read (visible text)
+    Daemon->>Herdr: pane.graphics.stream frame at the block's row
+  end
+  Herdr-->>User: picture drawn over the block

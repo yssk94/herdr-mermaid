@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""herdr-mermaid: draw the mermaid diagrams Claude Code emits over their own code blocks in a herdr pane.
+
+  start   --transcript PATH --owner-pid PID   (SessionStart hook) restart this pane's daemon
+  daemon  --transcript PATH --owner-pid PID   the follower: tails the transcript, renders, overlays
+  emit    FILE.mmd                            print the padded ```mermaid block to paste at the end of a message
+  check                                       (Stop hook) send the turn back if a mermaid block was not emitted
+  remind                                      (UserPromptSubmit hook) print the one-line instruction
+  self-check
+Signals: SIGUSR1 toggles a full-pane zoom of the diagram currently shown.
+"""
+import argparse, base64, hashlib, json, math, os, re, shutil, signal, socket, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MERMAID_JS = os.path.join(ROOT, "vendor", "mermaid.min.js")
+FILLER = "%%"                    # a mermaid comment: pads the block without breaking the source
+STAMP = "%% herdr-mermaid"       # last line of every emitted block; the Stop hook looks for it
+BG = (22, 22, 28)                # matches the dark theme page background
+PAD = 16
+FENCE = re.compile(r"^```mermaid[ \t]*\n(.*?)\n```[ \t]*$", re.S | re.M)
+
+
+# ---------------------------------------------------------------- herdr socket
+
+def herdr_env():
+    try:
+        return os.environ["HERDR_SOCKET_PATH"], os.environ["HERDR_PANE_ID"]
+    except KeyError:
+        raise SystemExit("not inside a herdr pane (HERDR_SOCKET_PATH / HERDR_PANE_ID unset)")
+
+
+def call(method, params):
+    # herdr closes the connection after each reply, so one request per socket.
+    sock_path, _ = herdr_env()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    s.settimeout(5)
+    s.sendall((json.dumps({"id": "1", "method": method, "params": params}) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    reply = json.loads(buf.split(b"\n")[0])
+    if "error" in reply:
+        raise OSError("%s: %s" % (method, reply["error"].get("message", reply["error"])))
+    return reply["result"]
+
+
+def pane():
+    return herdr_env()[1]
+
+
+def read_text():
+    return call("pane.read", {"pane_id": pane(), "source": "visible"})["read"]["text"]
+
+
+def pane_cells():
+    layout = call("pane.layout", {"pane_id": pane()})["layout"]
+    if layout["zoomed"]:  # the pane fills the tab, but its rect still reports the unzoomed size
+        rect = layout["area"]
+    else:
+        rect = next(p["rect"] for p in layout["panes"] if p["pane_id"] == pane())
+    return rect["width"], rect["height"]
+
+
+def graphics_info():
+    info = call("pane.graphics.info", {"pane_id": pane()})
+    if info["file_frame_transport"] != "direct-kitty":
+        raise SystemExit("this herdr client has no direct-kitty transport (%s); "
+                         "herdr-mermaid needs a local Ghostty, kitty or WezTerm"
+                         % info["file_frame_transport"])
+    return info
+
+
+def cache_dir():
+    d = os.path.join(os.path.expanduser("~/.cache/herdr-mermaid"), pane().replace(":", "_"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------- rendering (Chrome only)
+
+def chrome_path():
+    env = os.environ.get("HERDR_MERMAID_CHROME")
+    if env:
+        return env
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if os.path.exists(mac):
+        return mac
+    raise SystemExit("no Chrome/Chromium on PATH; set HERDR_MERMAID_CHROME")
+
+
+def chrome(*args):
+    return subprocess.run([chrome_path(), "--headless", "--disable-gpu", "--no-sandbox",
+                           "--hide-scrollbars", "--virtual-time-budget=15000", *args],
+                          capture_output=True, text=True, timeout=120).stdout
+
+
+def title_of(dom):
+    start = dom.find("<title>") + len("<title>")
+    return dom[start:dom.find("</title>", start)]
+
+
+# The source stays inside a text/plain script: labels carry <br> and <n>, which the HTML
+# parser would eat if the diagram were written into the document as markup.
+RENDER_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
+<style>html,body{margin:0;padding:0;background:__BG__}#d{display:inline-block;padding:__PAD__px}</style>
+<div id="d"></div>
+<script id="s" type="text/plain">__SRC__</script>
+<script src="file://__JS__"></script>
+<script>
+(async () => {
+  try {
+    mermaid.initialize({startOnLoad:false, theme:"__THEME__",
+      sequence:{useMaxWidth:false}, flowchart:{useMaxWidth:false}});
+    const {svg} = await mermaid.render("g", document.getElementById("s").textContent);
+    document.getElementById("d").innerHTML = svg;
+    const r = document.querySelector("#d svg").getBoundingClientRect();
+    document.title = Math.ceil(r.width) + "x" + Math.ceil(r.height);
+  } catch (e) { document.title = "ERR: " + (e && e.message ? e.message : e); }
+})();
+</script>
+"""
+
+# Chrome decodes the screenshot for us: raw RGBA out of a canvas, base64 in the DOM.
+# The PNG goes in as a data: URL; a file:// image would taint the canvas and block getImageData.
+DECODE_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
+<img id="i" src="data:image/png;base64,__PNG__"><pre id="o"></pre>
+<script>
+const i = document.getElementById("i");
+i.onload = () => {
+  try {
+    const c = document.createElement("canvas"); c.width = i.naturalWidth; c.height = i.naturalHeight;
+    const x = c.getContext("2d"); x.drawImage(i, 0, 0);
+    const d = x.getImageData(0, 0, c.width, c.height).data;
+    let s = ""; for (let k = 0; k < d.length; k += 32768) s += String.fromCharCode.apply(null, d.subarray(k, k + 32768));
+    document.getElementById("o").textContent = btoa(s);
+    document.title = c.width + "x" + c.height;
+  } catch (e) { document.title = "ERR: " + (e && e.message ? e.message : e); }
+};
+i.onerror = () => { document.title = "ERR: image load"; };
+</script>
+"""
+
+
+def natural_size(src, theme, workdir):
+    """Lay the diagram out once; returns (page_path, css_width, css_height)."""
+    page = os.path.join(workdir, "render.html")
+    with open(page, "w") as f:
+        f.write(RENDER_PAGE.replace("__SRC__", src).replace("__THEME__", theme)
+                .replace("__BG__", "#%02x%02x%02x" % BG).replace("__PAD__", str(PAD))
+                .replace("__JS__", MERMAID_JS))
+    title = title_of(chrome("--dump-dom", "file://" + page))
+    if not title or title.startswith("ERR") or "x" not in title:
+        raise RuntimeError("mermaid render failed: " + (title or "no title"))
+    w, h = (int(v) + PAD * 2 for v in title.split("x"))
+    return page, w, h
+
+
+def render_rgba(src, theme, box_px, workdir):
+    """Render the diagram scaled into box_px=(w, h); returns (rgba_bytes, width, height)."""
+    page, w, h = natural_size(src, theme, workdir)
+    scale = min(box_px[0] / w, box_px[1] / h)
+    png = os.path.join(workdir, "frame.png")
+    chrome("--screenshot=" + png, "--force-device-scale-factor=%s" % scale,
+           "--window-size=%d,%d" % (w, h), "file://" + page)
+    decode = os.path.join(workdir, "decode.html")
+    with open(decode, "w") as f:
+        f.write(DECODE_PAGE.replace("__PNG__", base64.b64encode(open(png, "rb").read()).decode()))
+    dom = chrome("--dump-dom", "file://" + decode)
+    title = title_of(dom)
+    if not title or title.startswith("ERR") or "x" not in title:
+        raise RuntimeError("png decode failed: " + (title or "no title"))
+    start = dom.find('<pre id="o">') + len('<pre id="o">')
+    data = base64.b64decode(dom[start:dom.find("</pre>", start)])
+    pw, ph = (int(v) for v in title.split("x"))
+    if len(data) != pw * ph * 4:
+        raise RuntimeError("decoded %d bytes for %dx%d" % (len(data), pw, ph))
+    return data, pw, ph
+
+
+def letterbox(rgba, w, h, box_w, box_h):
+    """Center the image on a BG-filled canvas of box_w x box_h pixels (for zoom)."""
+    out = bytearray(bytes(BG) + b"\xff") * (box_w * box_h)
+    x0, y0 = (box_w - w) // 2, (box_h - h) // 2
+    for y in range(h):
+        dst = ((y0 + y) * box_w + x0) * 4
+        out[dst:dst + w * 4] = rgba[y * w * 4:(y + 1) * w * 4]
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- graphics stream
+
+class Stream:
+    """A pane graphics layer fed by direct-kitty file frames: moves cost one JSON line."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(herdr_env()[0])
+        self.sock.settimeout(30)
+        self.buf = b""
+        self.seq = 0
+        self.frame = None
+        self.cols = self.rows = 0
+        self._send({"id": "s", "method": "pane.graphics.stream", "params": {"pane_id": pane()}})
+        self._recv()
+
+    def set_frame(self, frame):
+        path, width, height, self.cols, self.rows = frame
+        rev = (self.frame or {}).get("revision", 0) + 1
+        self.frame = {"format": "rgba", "transport": "direct-kitty", "revision": rev,
+                      "image_width": width, "image_height": height, "file": {"path": path}}
+
+    def _send(self, obj):
+        self.sock.sendall((json.dumps(obj) + "\n").encode())
+
+    def _recv(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(1 << 20)
+            if not chunk:
+                raise OSError("graphics stream closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        reply = json.loads(line)
+        if "error" in reply:
+            raise OSError(reply["error"].get("message", "frame rejected"))
+        return reply
+
+    def place(self, row, col, rows=None):
+        self.seq += 1
+        self._send(dict(self.frame, sequence=self.seq,
+                        placement={"viewport_row": row, "viewport_col": col,
+                                   "grid_cols": self.cols, "grid_rows": rows or self.rows}))
+        self._recv()
+
+    def hide(self):
+        # herdr drops a placement whose row is past the pane height; a negative row would
+        # instead be read as a top-clip and keep drawing, pinning the image to the top edge.
+        if self.frame:
+            self.place(1 << 15, 0)
+
+
+def write_frame(frame_dir, tag, rgba, w, h, cell):
+    path = os.path.join(frame_dir, "hm-%d-%s.rgba" % (os.getpid(), tag))
+    # herdr only accepts a same-uid regular 0600 single-link file of the exact frame length
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(rgba)
+    # image pixels map 1:1 onto the terminal, so the grid is just pixels over the cell size
+    return path, w, h, math.ceil(w / cell[0]), math.ceil(h / cell[1])
+
+
+# ---------------------------------------------------------------- transcript and blocks
+
+def mermaid_blocks(text):
+    return [m.group(1) for m in FENCE.finditer(text)]
+
+
+def assistant_texts(line):
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return []
+    if obj.get("type") != "assistant":
+        return []
+    content = obj.get("message", {}).get("content", [])
+    if isinstance(content, str):
+        return [content]
+    return [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+
+
+class Block:
+    def __init__(self, src):
+        self.src = src
+        self.lines = src.split("\n")
+        # the first three non-empty source lines, as Claude Code shows them (indent stripped)
+        self.key = [l.strip() for l in self.lines if l.strip()][:3]
+        self.frame = None       # (path, w, h, grid_cols, grid_rows) for the block-sized render
+        self.zoom = None        # same, letterboxed to the pane
+
+    def locate(self, rows):
+        """(top_row, col) of the newest on-screen copy of this block, or None."""
+        found = None
+        for r in range(len(rows) - len(self.key) + 1):
+            body = rows[r].lstrip()
+            if not body.startswith(self.key[0]):
+                continue
+            if all(rows[r + i].lstrip().startswith(k) for i, k in enumerate(self.key)):
+                found = (r, len(rows[r]) - len(body))
+        return found
+
+
+def transcript_end(rows):
+    """Row of the rule above Claude Code's input prompt; the overlay must stop there."""
+    for r in range(len(rows) - 1, -1, -1):
+        if rows[r].lstrip().startswith(("❯", "›")):
+            return r - 1
+    return len(rows)
+
+
+# ---------------------------------------------------------------- daemon
+
+def daemon(a):
+    info = graphics_info()
+    cell = (info["cell_width_px"], info["cell_height_px"])
+    frame_dir = info["file_frame_directory"]
+    work = cache_dir()
+    blocks = {}                 # key tuple -> Block
+    state = {"cols": 0, "zoomed": False, "shown": None}
+    toggles = []
+    signal.signal(signal.SIGUSR1, lambda *_: toggles.append(1))
+    stream = Stream()
+
+    def log(*parts):
+        print(time.strftime("%H:%M:%S"), *parts, file=sys.stderr, flush=True)
+
+    def drop_frames():
+        for b in blocks.values():
+            for f in (b.frame, b.zoom):
+                if f:
+                    try:
+                        os.remove(f[0])
+                    except OSError:
+                        pass
+            b.frame = b.zoom = None
+
+    def cleanup(why):
+        log("exit:", why)
+        try:
+            stream.sock.close()  # closing the stream drops its layer
+        except OSError:
+            pass
+        drop_frames()
+        try:
+            os.remove(os.path.join(work, "daemon.pid"))
+        except OSError:
+            pass
+        sys.exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda *_: cleanup("signal"))
+    with open(os.path.join(work, "daemon.pid"), "w") as f:
+        f.write(str(os.getpid()))
+
+    def ensure_frame(b, pane_w, pane_h):
+        if state["zoomed"]:
+            if not b.zoom:
+                box = (pane_w * cell[0], (pane_h - 6) * cell[1])
+                rgba, w, h = render_rgba(b.src, a.theme, box, work)
+                rgba = letterbox(rgba, w, h, *box)
+                b.zoom = write_frame(frame_dir, "zoom-%s" % id(b), rgba, box[0], box[1], cell)
+            return b.zoom
+        if not b.frame:
+            box = ((pane_w - 4) * cell[0], len(b.lines) * cell[1])
+            rgba, w, h = render_rgba(b.src, a.theme, box, work)
+            b.frame = write_frame(frame_dir, "block-%s" % id(b), rgba, w, h, cell)
+        return b.frame
+
+    pos_file = 0
+    placed = None
+    failures = 0
+    ticks = 0
+    log("daemon up: pane", pane(), "transcript", a.transcript)
+    while True:
+        ticks += 1
+        if ticks % 50 == 0:
+            try:
+                os.kill(a.owner_pid, 0)
+            except OSError:
+                cleanup("owner pid %d gone" % a.owner_pid)
+        try:
+            # 1. new mermaid blocks in the transcript
+            if ticks % 10 == 1 and os.path.exists(a.transcript):
+                with open(a.transcript, "rb") as f:
+                    f.seek(pos_file)
+                    chunk = f.read()
+                    pos_file = f.tell()
+                for line in chunk.split(b"\n"):
+                    for text in assistant_texts(line):
+                        for src in mermaid_blocks(text):
+                            b = Block(src)
+                            if b.key and tuple(b.key) not in blocks:
+                                blocks[tuple(b.key)] = b
+                                log("new block:", b.key[0][:40], "(%d lines)" % len(b.lines))
+            # 2. pane resize -> every render is stale
+            pane_w, pane_h = pane_cells() if ticks % 25 == 0 or not state["cols"] else (state["cols"], None)
+            if pane_w != state["cols"]:
+                state["cols"] = pane_w
+                if pane_h is None:
+                    pane_w, pane_h = pane_cells()
+                stream.hide()
+                drop_frames()
+                placed = None
+            # 3. zoom toggle
+            if toggles:
+                toggles.clear()
+                if graphics_info()["pane_visible"]:
+                    state["zoomed"] = not state["zoomed"]
+                    placed = None
+            # 4. which block is on screen
+            rows = read_text().split("\n")
+            end = transcript_end(rows)
+            target = None
+            for b in blocks.values():
+                hit = b.locate(rows)
+                if hit and (target is None or hit[0] > target[1][0]):
+                    target = (b, hit)
+            if target is None and state["zoomed"] and state["shown"]:
+                target = (state["shown"], (0, 0))   # keep the zoomed diagram while it is open
+            if target is None:
+                pos = None
+            else:
+                b, (top, col) = target
+                if state["zoomed"]:
+                    pos = (b, 0, 0, end)
+                else:
+                    pos = (b, top, col, end)
+            if pos != placed:
+                if pos and pos[1] >= 0 and pos[3] - pos[1] > 0:
+                    b, top, col, end = pos
+                    if pane_h is None:
+                        pane_w, pane_h = pane_cells()
+                    frame = ensure_frame(b, pane_w, pane_h)
+                    if state["shown"] is not b or stream.frame is None or stream.frame["file"]["path"] != frame[0]:
+                        stream.set_frame(frame)
+                        state["shown"] = b
+                    rows_fit = len(b.lines) if not state["zoomed"] else stream.rows
+                    # A negative top makes herdr paint over the tab bar, so the block is shown
+                    # only while its first row is on screen; the bottom is cropped above the input box.
+                    stream.place(top, col, min(stream.rows, rows_fit, end - top))
+                else:
+                    stream.hide()
+                placed = pos
+            failures = 0
+        except (OSError, ValueError, KeyError, StopIteration, RuntimeError, subprocess.SubprocessError) as e:
+            failures += 1
+            if failures <= 3 or failures % 50 == 0:
+                log("warn %d: %r" % (failures, e))
+            if failures > 100:  # herdr is not coming back
+                cleanup("100 consecutive failures")
+        time.sleep(a.interval)
+
+
+# ---------------------------------------------------------------- hook entry points
+
+def start(a):
+    """SessionStart: (re)start the daemon for this pane, detached from the hook."""
+    if os.environ.get("HERDR_ENV") != "1":
+        return
+    hook = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    transcript = a.transcript or hook.get("transcript_path")
+    if not transcript:
+        return
+    owner = a.owner_pid or claude_pid()
+    work = cache_dir()
+    pidfile = os.path.join(work, "daemon.pid")
+    try:
+        os.kill(int(open(pidfile).read()), signal.SIGTERM)
+        time.sleep(0.3)
+    except (OSError, ValueError):
+        pass
+    log = open(os.path.join(work, "daemon.log"), "ab")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon",
+                      "--transcript", transcript, "--owner-pid", str(owner),
+                      "--theme", a.theme, "--interval", str(a.interval)],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+
+
+def claude_pid():
+    """Nearest ancestor whose command is claude; the daemon exits when it goes away."""
+    pid = os.getppid()
+    for _ in range(10):
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout.split()
+        if len(out) < 2:
+            break
+        if os.path.basename(out[1]) == "claude":
+            return pid
+        pid = int(out[0])
+    return os.getppid()
+
+
+def emit(a):
+    src = open(a.file).read().rstrip("\n")
+    lines = [l for l in src.split("\n") if l.strip() != STAMP]
+    info = graphics_info()
+    cell = (info["cell_width_px"], info["cell_height_px"])
+    pane_w, pane_h = pane_cells()
+    _, w, h = natural_size(src, a.theme, cache_dir())
+    need = math.ceil(h * ((pane_w - 4) * cell[0] / w) / cell[1])
+    hole = max(len(lines) + 1, min(need, pane_h - 8))
+    out = ["```mermaid"] + lines + [FILLER] * (hole - len(lines) - 1) + [STAMP, "```"]
+    print("\n".join(out))
+    print("hole rows: %d (pane %dx%d)" % (hole, pane_w, pane_h), file=sys.stderr)
+
+
+def check(a):
+    """Stop hook: send the turn back if the last message has a mermaid block that was not emitted."""
+    hook = json.load(sys.stdin)
+    if hook.get("stop_hook_active") or os.environ.get("HERDR_ENV") != "1":
+        return
+    last = ""
+    with open(hook["transcript_path"], "rb") as f:
+        for line in f:
+            texts = assistant_texts(line)
+            if texts:
+                last = "\n".join(texts)
+    blocks = list(FENCE.finditer(last))
+    if not blocks:
+        return
+    problems = []
+    for m in blocks:
+        if m.group(1).rstrip().split("\n")[-1].strip() != STAMP:
+            problems.append("a ```mermaid block was written by hand instead of `herdr-mermaid emit`")
+    if last[blocks[-1].end():].strip():
+        problems.append("the ```mermaid block is not the last thing in the message")
+    if problems:
+        print(json.dumps({"decision": "block", "reason":
+            "; ".join(sorted(set(problems))) + ". Re-send the message: write the diagram to a .mmd file, run "
+            "`herdr-mermaid emit FILE.mmd`, and paste its stdout verbatim as the final content."}))
+
+
+def remind(a):
+    if os.environ.get("HERDR_ENV") == "1":
+        print("herdr-mermaid: to show a mermaid diagram, write it to a .mmd file, run "
+              "`herdr-mermaid emit FILE.mmd`, and paste the output verbatim as the LAST content of the message. "
+              "Never write a ```mermaid block by hand and never quote the block in prose.")
+
+
+def self_check(a):
+    b = Block("sequenceDiagram\n  autonumber\n  A->>B: x\n%%\n%% herdr-mermaid")
+    assert b.key == ["sequenceDiagram", "autonumber", "A->>B: x"]
+    rows = ["noise", "  sequenceDiagram", "  autonumber", "  A->>B: x", "  %%"]
+    assert b.locate(rows) == (1, 2)
+    assert b.locate(["  sequenceDiagram", "  unrelated", "  A->>B: x"]) is None
+    assert b.locate(["see `sequenceDiagram` above", "autonumber", "A->>B: x"]) is None
+    twice = rows + rows
+    assert b.locate(twice) == (6, 2)                       # newest copy wins
+    assert transcript_end(["a", "b", "───", "❯", "──", "s"]) == 2
+    assert transcript_end(["a", "b"]) == 2
+    text = "hi\n```mermaid\nflowchart LR\n  A --> B\n%% herdr-mermaid\n```\n"
+    assert mermaid_blocks(text) == ["flowchart LR\n  A --> B\n%% herdr-mermaid"]
+    assert assistant_texts(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "t"}]}})) == ["t"]
+    assert assistant_texts("not json") == []
+    lb = letterbox(b"\x01\x02\x03\x04" * 2, 2, 1, 4, 3)
+    assert len(lb) == 4 * 3 * 4 and lb[4 * 4 + 1 * 4:4 * 4 + 1 * 4 + 8] == b"\x01\x02\x03\x04" * 2
+    print("self-check ok")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("start", "daemon"):
+        p = sub.add_parser(name)
+        p.add_argument("--transcript")
+        p.add_argument("--owner-pid", type=int)
+        p.add_argument("--theme", default="dark")
+        p.add_argument("--interval", type=float, default=0.05)
+    p = sub.add_parser("emit")
+    p.add_argument("file")
+    p.add_argument("--theme", default="dark")
+    sub.add_parser("check")
+    sub.add_parser("remind")
+    sub.add_parser("self-check")
+    a = ap.parse_args()
+    {"start": start, "daemon": daemon, "emit": emit, "check": check,
+     "remind": remind, "self-check": self_check}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

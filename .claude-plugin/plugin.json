@@ -1,0 +1,11 @@
+{
+  "name": "herdr-mermaid",
+  "description": "Render mermaid diagrams from Claude Code's output over their own code blocks inside a herdr pane (direct-kitty graphics).",
+  "version": "0.1.0",
+  "keywords": [
+    "herdr",
+    "mermaid",
+    "diagram",
+    "kitty-graphics"
+  ]
+}
