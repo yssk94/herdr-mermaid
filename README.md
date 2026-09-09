@@ -12,6 +12,7 @@ with direct-kitty file frames, so moving it costs one JSON line (about 5 ms).
 | herdr 0.9 or newer, attached from a local Ghostty, kitty or WezTerm | `pane.graphics.stream` with `direct-kitty` file transport |
 | Google Chrome or Chromium (`HERDR_MERMAID_CHROME` to override the path) | mermaid is rendered headless; Chrome also decodes the screenshot to raw pixels |
 | Python 3.9 or newer | the tool is a single standard-library script |
+| Claude Code with plugin hooks and skills (verified on 2.1.266) | the daemon is started by a `SessionStart` hook and the block format is enforced by a `Stop` hook |
 | macOS or Linux | Windows herdr is beta and untested here |
 
 `vendor/mermaid.min.js` is bundled (MIT, see `vendor/mermaid.LICENSE`). Nothing is fetched at
@@ -19,12 +20,20 @@ run time and diagram content never leaves the machine.
 
 ## Install
 
+Unpack or clone the directory anywhere, then link it into Claude Code's skills directory.
+Everything under `~/.claude/skills/` loads as a plugin at the start of every session, hooks included:
+
 ```bash
-git clone <this repository> herdr-mermaid
-claude --plugin-dir ./herdr-mermaid
+ln -s /path/to/herdr-mermaid ~/.claude/skills/herdr-mermaid
+claude plugin details herdr-mermaid@skills-dir     # should list 1 skill and 3 hooks
 ```
 
-or add the directory to a marketplace and `/plugin install herdr-mermaid`.
+Alternatives: `claude --plugin-dir /path/to/herdr-mermaid` for one session, or
+`claude plugin marketplace add /path/to/herdr-mermaid` followed by `claude plugin install herdr-mermaid@herdr-mermaid`.
+
+If `emit` or the daemon log says herdr reports no direct-kitty file transport, detach and
+reattach the herdr client once (`ctrl+b q`, then `herdr`); herdr renegotiates graphics support
+on attach.
 
 Optional herdr keybinding for the zoom toggle (`~/.config/herdr/config.toml`):
 

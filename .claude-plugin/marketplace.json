@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "herdr-mermaid",
+  "description": "Mermaid diagrams drawn over their own code blocks inside herdr panes running Claude Code.",
+  "plugins": [
+    {
+      "name": "herdr-mermaid",
+      "description": "Render mermaid diagrams from Claude Code's output over their own code blocks inside a herdr pane.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

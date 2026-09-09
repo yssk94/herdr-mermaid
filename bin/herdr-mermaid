@@ -66,13 +66,24 @@ def pane_cells():
     return rect["width"], rect["height"]
 
 
-def graphics_info():
-    info = call("pane.graphics.info", {"pane_id": pane()})
-    if info["file_frame_transport"] != "direct-kitty":
-        raise SystemExit("this herdr client has no direct-kitty transport (%s); "
-                         "herdr-mermaid needs a local Ghostty, kitty or WezTerm"
-                         % info["file_frame_transport"])
-    return info
+NO_TRANSPORT = ("herdr reports no direct-kitty file transport for this client. It needs a local "
+                "Ghostty, kitty or WezTerm; if you have one, detach and reattach herdr once so it "
+                "renegotiates graphics support.")
+
+
+def graphics_info(wait=0):
+    """Capability info for this pane; waits up to `wait` seconds for file transport to be negotiated."""
+    deadline = time.time() + wait
+    while True:
+        try:
+            info = call("pane.graphics.info", {"pane_id": pane()})
+        except OSError as e:          # e.g. "host cell size is unavailable" while no client is attached
+            info = {"error": str(e)}
+        if info.get("file_frame_transport") == "direct-kitty":
+            return info
+        if time.time() >= deadline:
+            raise RuntimeError(info.get("error") or NO_TRANSPORT)
+        time.sleep(0.5)
 
 
 def cache_dir():
@@ -97,17 +108,6 @@ def chrome_path():
     raise SystemExit("no Chrome/Chromium on PATH; set HERDR_MERMAID_CHROME")
 
 
-def chrome(*args):
-    return subprocess.run([chrome_path(), "--headless", "--disable-gpu", "--no-sandbox",
-                           "--hide-scrollbars", "--virtual-time-budget=15000", *args],
-                          capture_output=True, text=True, timeout=120).stdout
-
-
-def title_of(dom):
-    start = dom.find("<title>") + len("<title>")
-    return dom[start:dom.find("</title>", start)]
-
-
 # The source stays inside a text/plain script: labels carry <br> and <n>, which the HTML
 # parser would eat if the diagram were written into the document as markup.
 RENDER_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
@@ -129,66 +129,161 @@ RENDER_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
 </script>
 """
 
-# Chrome decodes the screenshot for us: raw RGBA out of a canvas, base64 in the DOM.
-# The PNG goes in as a data: URL; a file:// image would taint the canvas and block getImageData.
-DECODE_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
-<img id="i" src="data:image/png;base64,__PNG__"><pre id="o"></pre>
-<script>
-const i = document.getElementById("i");
-i.onload = () => {
-  try {
-    const c = document.createElement("canvas"); c.width = i.naturalWidth; c.height = i.naturalHeight;
-    const x = c.getContext("2d"); x.drawImage(i, 0, 0);
-    const d = x.getImageData(0, 0, c.width, c.height).data;
-    let s = ""; for (let k = 0; k < d.length; k += 32768) s += String.fromCharCode.apply(null, d.subarray(k, k + 32768));
-    document.getElementById("o").textContent = btoa(s);
-    document.title = c.width + "x" + c.height;
-  } catch (e) { document.title = "ERR: " + (e && e.message ? e.message : e); }
-};
-i.onerror = () => { document.title = "ERR: image load"; };
-</script>
-"""
 
 
-def natural_size(src, theme, workdir):
-    """Lay the diagram out once; returns (page_path, css_width, css_height)."""
-    page = os.path.join(workdir, "render.html")
-    with open(page, "w") as f:
-        f.write(RENDER_PAGE.replace("__SRC__", src).replace("__THEME__", theme)
-                .replace("__BG__", "#%02x%02x%02x" % BG).replace("__PAD__", str(PAD))
-                .replace("__JS__", MERMAID_JS))
-    title = title_of(chrome("--dump-dom", "file://" + page))
-    if not title or title.startswith("ERR") or "x" not in title:
-        raise RuntimeError("mermaid render failed: " + (title or "no title"))
-    w, h = (int(v) + PAD * 2 for v in title.split("x"))
-    return page, w, h
+class Renderer:
+    """One headless Chrome driven over the DevTools pipe; reused across renders, closed when idle."""
 
+    IDLE = 60
 
-def render_rgba(src, theme, box_px, workdir):
-    """Render the diagram scaled into box_px=(w, h); returns (rgba_bytes, width, height)."""
-    page, w, h = natural_size(src, theme, workdir)
-    scale = min(box_px[0] / w, box_px[1] / h)
-    png = os.path.join(workdir, "frame.png")
-    chrome("--screenshot=" + png, "--force-device-scale-factor=%s" % scale,
-           "--window-size=%d,%d" % (w, h), "file://" + page)
-    decode = os.path.join(workdir, "decode.html")
-    with open(decode, "w") as f:
-        f.write(DECODE_PAGE.replace("__PNG__", base64.b64encode(open(png, "rb").read()).decode()))
-    dom = chrome("--dump-dom", "file://" + decode)
-    title = title_of(dom)
-    if not title or title.startswith("ERR") or "x" not in title:
-        raise RuntimeError("png decode failed: " + (title or "no title"))
-    start = dom.find('<pre id="o">') + len('<pre id="o">')
-    data = base64.b64decode(dom[start:dom.find("</pre>", start)])
-    pw, ph = (int(v) for v in title.split("x"))
-    if len(data) != pw * ph * 4:
-        raise RuntimeError("decoded %d bytes for %dx%d" % (len(data), pw, ph))
-    return data, pw, ph
+    def __init__(self, workdir):
+        self.workdir = workdir
+        self.proc = None
+        self.session = None
+        self.last = 0.0
+        self.msg_id = 0
+        self.buf = b""
+
+    # -- process ---------------------------------------------------------------
+    def _start(self):
+        to_chrome_r, to_chrome_w = os.pipe()
+        from_chrome_r, from_chrome_w = os.pipe()
+        # Chrome speaks the protocol on fds 3 (in) and 4 (out). subprocess closes every fd not in
+        # pass_fds after preexec_fn, so the pipe ends have to *be* 3 and 4 in this process while
+        # we spawn; whatever sat there before is parked on a dup and put back afterwards.
+        parked = {}
+        for fd, want in ((3, to_chrome_r), (4, from_chrome_w)):
+            try:
+                parked[fd] = os.dup(fd)
+            except OSError:
+                parked[fd] = None
+            os.dup2(want, fd)
+        try:
+            self.proc = subprocess.Popen(
+                [chrome_path(), "--headless", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+                 "--remote-debugging-pipe", "about:blank"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=(3, 4))
+        finally:
+            for fd, keep in parked.items():
+                if keep is None:
+                    os.close(fd)
+                else:
+                    os.dup2(keep, fd)
+                    os.close(keep)
+            os.close(to_chrome_r)
+            os.close(from_chrome_w)
+        self.w, self.r = to_chrome_w, from_chrome_r
+        target = self._cmd("Target.createTarget", {"url": "about:blank"})["targetId"]
+        self.session = self._cmd("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+        self._cmd("Page.enable")
+        self._cmd("Runtime.enable")
+
+    def close(self):
+        if self.proc:
+            for fd in (self.w, self.r):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+            self.session = None
+            self.buf = b""
+
+    def idle_close(self):
+        if self.proc and time.time() - self.last > self.IDLE:
+            self.close()
+
+    # -- protocol: NUL-terminated JSON both ways --------------------------------
+    def _cmd(self, method, params=None, timeout=30):
+        self.msg_id += 1
+        msg = {"id": self.msg_id, "method": method, "params": params or {}}
+        if self.session and not method.startswith("Target."):
+            msg["sessionId"] = self.session
+        os.write(self.w, json.dumps(msg).encode() + b"\0")
+        deadline = time.time() + timeout
+        while True:
+            while b"\0" not in self.buf:
+                if time.time() > deadline:
+                    raise RuntimeError("chrome did not answer " + method)
+                chunk = os.read(self.r, 1 << 20)
+                if not chunk:
+                    raise RuntimeError("chrome pipe closed")
+                self.buf += chunk
+            raw, self.buf = self.buf.split(b"\0", 1)
+            reply = json.loads(raw)
+            if reply.get("id") == self.msg_id:
+                if "error" in reply:
+                    raise RuntimeError("%s: %s" % (method, reply["error"].get("message")))
+                return reply.get("result", {})
+
+    def _eval(self, expression, timeout=30):
+        res = self._cmd("Runtime.evaluate", {"expression": expression, "awaitPromise": True,
+                                             "returnByValue": True}, timeout)
+        if "exceptionDetails" in res:
+            raise RuntimeError("page script failed: " + json.dumps(res["exceptionDetails"])[:300])
+        return res["result"].get("value")
+
+    # -- rendering -------------------------------------------------------------
+    def natural_size(self, src, theme):
+        """Lay the diagram out at scale 1; returns (css_width, css_height), page left loaded."""
+        if not self.proc:
+            self._start()
+        self.last = time.time()
+        page = os.path.join(self.workdir, "render.html")
+        with open(page, "w") as f:
+            f.write(RENDER_PAGE.replace("__SRC__", src).replace("__THEME__", theme)
+                    .replace("__BG__", "#%02x%02x%02x" % BG).replace("__PAD__", str(PAD))
+                    .replace("__JS__", MERMAID_JS))
+        self._cmd("Emulation.clearDeviceMetricsOverride")
+        self._cmd("Page.navigate", {"url": "file://" + page})
+        title = self._eval("""new Promise((ok, ng) => {
+            const t0 = Date.now();
+            const tick = () => { if (document.title !== "pending") ok(document.title);
+                                 else if (Date.now() - t0 > 15000) ng(new Error("mermaid timeout"));
+                                 else setTimeout(tick, 20); };
+            tick(); })""")
+        if not title or title.startswith("ERR") or "x" not in title:
+            raise RuntimeError("mermaid render failed: " + (title or "no title"))
+        w, h = (int(v) + PAD * 2 for v in title.split("x"))
+        return w, h
+
+    def render_rgba(self, src, theme, box_px):
+        """Render the diagram scaled into box_px=(w, h); returns (bgra_bytes, width, height).
+
+        BGRA on purpose: herdr hands rgba primary frames to the terminal over its direct-kitty
+        gate and permanently disables file transport for the client if that handshake fails.
+        BGRA frames are read by herdr itself and sent inline, with the same placement speed."""
+        w, h = self.natural_size(src, theme)
+        scale = min(box_px[0] / w, box_px[1] / h)
+        self._cmd("Emulation.setDeviceMetricsOverride",
+                  {"width": w, "height": h, "deviceScaleFactor": scale, "mobile": False})
+        png = self._cmd("Page.captureScreenshot", {"format": "png"}, timeout=60)["data"]
+        # Chrome decodes its own screenshot: raw RGBA out of a canvas, base64 back over the pipe.
+        out = self._eval("""new Promise((ok, ng) => {
+            const i = new Image();
+            i.onload = () => { try {
+                const c = document.createElement("canvas"); c.width = i.naturalWidth; c.height = i.naturalHeight;
+                const x = c.getContext("2d"); x.drawImage(i, 0, 0);
+                const d = x.getImageData(0, 0, c.width, c.height).data;
+                for (let k = 0; k < d.length; k += 4) { const r = d[k]; d[k] = d[k + 2]; d[k + 2] = r; }  // RGBA -> BGRA
+                let s = ""; for (let k = 0; k < d.length; k += 32768) s += String.fromCharCode.apply(null, d.subarray(k, k + 32768));
+                ok(c.width + "x" + c.height + ":" + btoa(s)); } catch (e) { ng(e); } };
+            i.onerror = () => ng(new Error("png decode failed"));
+            i.src = "data:image/png;base64,%s"; })""" % png, timeout=60)
+        dims, data = out.split(":", 1)
+        pw, ph = (int(v) for v in dims.split("x"))
+        rgba = base64.b64decode(data)
+        if len(rgba) != pw * ph * 4:
+            raise RuntimeError("decoded %d bytes for %dx%d" % (len(rgba), pw, ph))
+        return rgba, pw, ph
 
 
 def letterbox(rgba, w, h, box_w, box_h):
     """Center the image on a BG-filled canvas of box_w x box_h pixels (for zoom)."""
-    out = bytearray(bytes(BG) + b"\xff") * (box_w * box_h)
+    out = bytearray(bytes(BG[::-1]) + b"\xff") * (box_w * box_h)   # BGRA
     x0, y0 = (box_w - w) // 2, (box_h - h) // 2
     for y in range(h):
         dst = ((y0 + y) * box_w + x0) * 4
@@ -197,6 +292,10 @@ def letterbox(rgba, w, h, box_w, box_h):
 
 
 # ---------------------------------------------------------------- graphics stream
+
+class StreamError(OSError):
+    """The graphics stream itself failed; the daemon reconnects on these only."""
+
 
 class Stream:
     """A pane graphics layer fed by direct-kitty file frames: moves cost one JSON line."""
@@ -215,22 +314,28 @@ class Stream:
     def set_frame(self, frame):
         path, width, height, self.cols, self.rows = frame
         rev = (self.frame or {}).get("revision", 0) + 1
-        self.frame = {"format": "rgba", "transport": "direct-kitty", "revision": rev,
+        self.frame = {"format": "bgra", "transport": "direct-kitty", "revision": rev,
                       "image_width": width, "image_height": height, "file": {"path": path}}
 
     def _send(self, obj):
-        self.sock.sendall((json.dumps(obj) + "\n").encode())
+        try:
+            self.sock.sendall((json.dumps(obj) + "\n").encode())
+        except OSError as e:
+            raise StreamError("graphics stream send failed: %s" % e)
 
     def _recv(self):
         while b"\n" not in self.buf:
-            chunk = self.sock.recv(1 << 20)
+            try:
+                chunk = self.sock.recv(1 << 20)
+            except OSError as e:
+                raise StreamError("graphics stream recv failed: %s" % e)
             if not chunk:
-                raise OSError("graphics stream closed")
+                raise StreamError("graphics stream closed")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         reply = json.loads(line)
         if "error" in reply:
-            raise OSError(reply["error"].get("message", "frame rejected"))
+            raise StreamError(reply["error"].get("message", "frame rejected"))
         return reply
 
     def place(self, row, col, rows=None):
@@ -248,7 +353,7 @@ class Stream:
 
 
 def write_frame(frame_dir, tag, rgba, w, h, cell):
-    path = os.path.join(frame_dir, "hm-%d-%s.rgba" % (os.getpid(), tag))
+    path = os.path.join(frame_dir, "hm-%d-%s-%d.rgba" % (os.getpid(), tag, time.time_ns()))
     # herdr only accepts a same-uid regular 0600 single-link file of the exact frame length
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as f:
@@ -308,60 +413,99 @@ def transcript_end(rows):
 # ---------------------------------------------------------------- daemon
 
 def daemon(a):
-    info = graphics_info()
+    work = cache_dir()
+    with open(os.path.join(work, "daemon.pid"), "w") as f:   # before any waiting, so `start` can replace us
+        f.write(str(os.getpid()))
+    while True:
+        try:
+            info = graphics_info(wait=5)
+            break
+        except (RuntimeError, OSError) as e:   # no transport yet, or herdr has no client attached
+            print(time.strftime("%H:%M:%S"), "waiting:", e, file=sys.stderr, flush=True)
+            try:
+                os.kill(a.owner_pid, 0)
+            except OSError:
+                sys.exit(0)
+            time.sleep(10)
     cell = (info["cell_width_px"], info["cell_height_px"])
     frame_dir = info["file_frame_directory"]
-    work = cache_dir()
     blocks = {}                 # key tuple -> Block
     state = {"cols": 0, "zoomed": False, "shown": None}
     toggles = []
     signal.signal(signal.SIGUSR1, lambda *_: toggles.append(1))
-    stream = Stream()
+    stream = None
+    renderer = Renderer(work)
 
     def log(*parts):
         print(time.strftime("%H:%M:%S"), *parts, file=sys.stderr, flush=True)
+
+    retired = []   # (path, retired_at): herdr keeps a lease on a frame file and re-reads it on every
+                   # redraw; deleting one it still references disables file transport for the client.
 
     def drop_frames():
         for b in blocks.values():
             for f in (b.frame, b.zoom):
                 if f:
-                    try:
-                        os.remove(f[0])
-                    except OSError:
-                        pass
+                    retired.append((f[0], time.time()))
             b.frame = b.zoom = None
+
+    def reap(grace=2.0, force=False):
+        keep = []
+        current = stream.frame["file"]["path"] if stream and stream.frame else None
+        for path, at in retired:
+            if force or (time.time() - at > grace and path != current):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            else:
+                keep.append((path, at))
+        retired[:] = keep
 
     def cleanup(why):
         log("exit:", why)
-        try:
-            stream.sock.close()  # closing the stream drops its layer
-        except OSError:
-            pass
+        if stream is not None:
+            try:
+                stream.hide()        # acknowledged, so herdr no longer paints from the frame files
+                stream.sock.close()  # closing the stream drops its layer and its file leases
+            except OSError:
+                pass
+        time.sleep(1.0)          # let herdr finish any redraw before the files disappear
         drop_frames()
+        reap(force=True)
+        renderer.close()
         try:
-            os.remove(os.path.join(work, "daemon.pid"))
+            pidfile = os.path.join(work, "daemon.pid")
+            if open(pidfile).read().strip() == str(os.getpid()):   # a replacement may already own it
+                os.remove(pidfile)
         except OSError:
             pass
         sys.exit(0)
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: cleanup("signal"))
-    with open(os.path.join(work, "daemon.pid"), "w") as f:
-        f.write(str(os.getpid()))
 
     def ensure_frame(b, pane_w, pane_h):
         if state["zoomed"]:
             if not b.zoom:
                 box = (pane_w * cell[0], (pane_h - 6) * cell[1])
-                rgba, w, h = render_rgba(b.src, a.theme, box, work)
+                rgba, w, h = renderer.render_rgba(b.src, a.theme, box)
                 rgba = letterbox(rgba, w, h, *box)
                 b.zoom = write_frame(frame_dir, "zoom-%s" % id(b), rgba, box[0], box[1], cell)
             return b.zoom
         if not b.frame:
             box = ((pane_w - 4) * cell[0], len(b.lines) * cell[1])
-            rgba, w, h = render_rgba(b.src, a.theme, box, work)
+            rgba, w, h = renderer.render_rgba(b.src, a.theme, box)
             b.frame = write_frame(frame_dir, "block-%s" % id(b), rgba, w, h, cell)
         return b.frame
+
+    def connect():
+        """(Re)open the graphics stream; every frame file belongs to the old layer and is retired."""
+        nonlocal stream
+        graphics_info(wait=5)
+        stream = Stream()
+        drop_frames()
+        log("graphics stream connected")
 
     pos_file = 0
     placed = None
@@ -371,11 +515,16 @@ def daemon(a):
     while True:
         ticks += 1
         if ticks % 50 == 0:
+            renderer.idle_close()
+            reap()
             try:
                 os.kill(a.owner_pid, 0)
             except OSError:
                 cleanup("owner pid %d gone" % a.owner_pid)
         try:
+            if stream is None:
+                connect()
+                placed = None
             # 1. new mermaid blocks in the transcript
             if ticks % 10 == 1 and os.path.exists(a.transcript):
                 with open(a.transcript, "rb") as f:
@@ -396,12 +545,12 @@ def daemon(a):
                 if pane_h is None:
                     pane_w, pane_h = pane_cells()
                 stream.hide()
-                drop_frames()
+                drop_frames()    # retired, not deleted: herdr may still replay them during the resize
                 placed = None
             # 3. zoom toggle
             if toggles:
                 toggles.clear()
-                if graphics_info()["pane_visible"]:
+                if call("pane.graphics.info", {"pane_id": pane()}).get("pane_visible"):
                     state["zoomed"] = not state["zoomed"]
                     placed = None
             # 4. which block is on screen
@@ -443,8 +592,15 @@ def daemon(a):
             failures += 1
             if failures <= 3 or failures % 50 == 0:
                 log("warn %d: %r" % (failures, e))
-            if failures > 100:  # herdr is not coming back
-                cleanup("100 consecutive failures")
+            if stream is not None and isinstance(e, StreamError):
+                try:
+                    stream.sock.close()
+                except OSError:
+                    pass
+                stream = None        # reconnect on the next tick (waits for file transport)
+                time.sleep(1.0)
+            if failures > 600:       # ~10 minutes without herdr answering: give up
+                cleanup("herdr unreachable")
         time.sleep(a.interval)
 
 
@@ -490,10 +646,14 @@ def claude_pid():
 def emit(a):
     src = open(a.file).read().rstrip("\n")
     lines = [l for l in src.split("\n") if l.strip() != STAMP]
-    info = graphics_info()
+    info = call("pane.graphics.info", {"pane_id": pane()})   # cell size only; no transport needed here
     cell = (info["cell_width_px"], info["cell_height_px"])
     pane_w, pane_h = pane_cells()
-    _, w, h = natural_size(src, a.theme, cache_dir())
+    renderer = Renderer(cache_dir())
+    try:
+        w, h = renderer.natural_size(src, a.theme)
+    finally:
+        renderer.close()
     need = math.ceil(h * ((pane_w - 4) * cell[0] / w) / cell[1])
     hole = max(len(lines) + 1, min(need, pane_h - 8))
     out = ["```mermaid"] + lines + [FILLER] * (hole - len(lines) - 1) + [STAMP, "```"]
