@@ -1,78 +1,70 @@
 # herdr-mermaid
 
-Claude Code plugin that renders the mermaid diagrams Claude emits and draws them over their own
-code blocks inside a [herdr](https://herdr.dev/) pane, following the block as the conversation
-scrolls. The terminal keeps rendering plain text; the picture is a herdr graphics layer placed
-with direct-kitty file frames, so moving it costs one JSON line (about 5 ms).
+Claude Code mod that draws the mermaid diagrams in Claude's replies as images, in place of
+their code blocks. The picture is part of the transcript: it scrolls, wraps and clips with the
+text around it, in herdr panes and in a plain Ghostty or kitty window alike.
 
 ## Requirements
 
 | Requirement | Why |
 |---|---|
-| herdr 0.9 or newer, attached from a local Ghostty, kitty or WezTerm | `pane.graphics.stream` with `direct-kitty` file transport |
-| Google Chrome or Chromium (`HERDR_MERMAID_CHROME` to override the path) | mermaid is rendered headless; Chrome also decodes the screenshot to raw pixels |
-| Python 3.9 or newer | the tool is a single standard-library script |
-| Claude Code with plugin hooks and skills (verified on 2.1.266) | the daemon is started by a `SessionStart` hook and the block format is enforced by a `Stop` hook |
-| macOS or Linux | Windows herdr is beta and untested here |
+| A terminal with kitty graphics: Ghostty, kitty 0.28+, or herdr 0.9.2+ attached from one of them | Claude Code draws the picture with kitty graphics unicode placeholders |
+| `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` inside herdr | Claude Code only enables images when the terminal reports itself as `ghostty` or `kitty`; herdr reports `herdr` |
+| Google Chrome or Chromium (`HERDR_MERMAID_CHROME` to override the path) | mermaid is rendered in headless Chrome |
+| Python 3.9 or newer | `bin/render-mermaid` is a single standard-library script |
+| Claude Code with function-hook mods (verified on 2.1.289) | the mod hooks `ui.render` for `AssistantMessage` |
 
 `vendor/mermaid.min.js` is bundled (MIT, see `vendor/mermaid.LICENSE`). Nothing is fetched at
 run time and diagram content never leaves the machine.
 
 ## Install
 
-Unpack or clone the directory anywhere, then link it into Claude Code's skills directory.
-Everything under `~/.claude/skills/` loads as a plugin at the start of every session, hooks included:
-
 ```bash
-ln -s /path/to/herdr-mermaid ~/.claude/skills/herdr-mermaid
-claude plugin details herdr-mermaid@skills-dir     # should list 1 skill and 3 hooks
+claude plugin marketplace add yssk94/herdr-mermaid
+claude plugin install herdr-mermaid@herdr-mermaid
 ```
 
-Alternatives: `claude --plugin-dir /path/to/herdr-mermaid` for one session, or
-`claude plugin marketplace add /path/to/herdr-mermaid` followed by `claude plugin install herdr-mermaid@herdr-mermaid`.
+Inside herdr, also set the variable in `~/.claude/settings.json`:
 
-If `emit` or the daemon log says herdr reports no direct-kitty file transport, detach and
-reattach the herdr client once (`ctrl+b q`, then `herdr`); herdr renegotiates graphics support
-on attach.
-
-Optional herdr keybinding for the zoom toggle (`~/.config/herdr/config.toml`):
-
-```toml
-[[keys.command]]
-key = "prefix+m"
-type = "shell"
-command = "pkill -USR1 -f 'herdr-mermaid daemon'"
-description = "toggle diagram zoom"
+```json
+{
+  "env": {
+    "CLAUDE_CODE_FORCE_TERMINAL_IMAGES": "1"
+  }
+}
 ```
+
+Set it only where every terminal you start Claude Code from supports kitty graphics;
+elsewhere it prints the image escape sequences as text.
+
+For development, `claude --plugin-dir /path/to/herdr-mermaid` loads a checkout for one session.
 
 ## How it works
 
 | Piece | Role |
 |---|---|
-| `SessionStart` hook | starts `herdr-mermaid daemon` for the pane with the session's transcript path; the daemon exits when Claude Code does |
-| daemon | tails the transcript for ```mermaid blocks, renders each with Chrome, finds the block on screen via `pane.read`, overlays the picture, re-renders on pane resize |
-| `emit` | pads a ```mermaid block so the picture fits the pane width; Claude pastes it as the last content of a message |
-| `UserPromptSubmit` hook | reminds Claude of the procedure every turn |
-| `Stop` hook | sends the turn back when a mermaid block was written by hand or is not last |
-| `SIGUSR1` | toggles a letterboxed full-pane zoom of the visible diagram |
+| `hooks/register.tsx` | on every assistant message drawn in a terminal, splits the text around its ```mermaid blocks, draws the text as markdown and each rendered block as an `Image` sized to the pane width and the picture's aspect ratio |
+| `bin/render-mermaid` | mermaid source on stdin, `{"png", "width", "height"}` on stdout; renders with headless Chrome at 2x and caches the PNG in `~/.cache/herdr-mermaid/` by source |
 
-State lives in `~/.cache/herdr-mermaid/<pane>/` (log, pid, render scratch). Frame files go
-to herdr's own `file_frame_directory` and are removed on exit.
+A block is shown as its source while it renders (about 6 s for a new diagram, instant from the
+cache) and stays as source, with the reason underneath, when mermaid rejects it.
+Other surfaces (desktop, VS Code, mobile) and replies without mermaid are left to Claude Code.
 
 ## Known limits
 
-- A block whose first row has scrolled above the pane is hidden rather than clipped
-  (herdr paints negative offsets over the tab bar).
-- One picture per pane at a time: the newest visible block wins.
-- The picture never exceeds the pane width; padding gives it height, not width.
-- Re-rendering after a resize takes 1 to 3 s (three headless Chrome launches).
-- Blocks are matched by their first three source lines; two diagrams with identical
-  first three lines in one session are treated as the same block.
+- The reply's leading bullet is not drawn on a message that contains a diagram.
+- Only fences that start a line as ```` ```mermaid ```` are drawn; indented fences (inside a list item), `~~~` fences
+  and fences of four backticks stay as source.
+- A reply whose text around a diagram runs past 10000 characters is left as source.
+- A diagram whose PNG exceeds 2 MiB at 2x is taken at 1x; one that still exceeds it stays as source.
+- A diagram that failed to render is not retried in the same session.
+- Rows are derived assuming terminal cells twice as tall as wide; other fonts stretch the picture slightly.
+- A picture is at most 255 columns by 255 rows.
 
 ## Development
 
 ```bash
-bin/herdr-mermaid self-check
-bin/herdr-mermaid emit examples/sequence.mmd     # inside a herdr pane
-tail -f ~/.cache/herdr-mermaid/*/daemon.log
+claude plugin validate .
+claude plugin test .
+bin/render-mermaid < examples/sequence.mmd | head -c 200
 ```

@@ -1,11 +1,12 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "herdr-mermaid",
-  "description": "Mermaid diagrams drawn over their own code blocks inside herdr panes running Claude Code.",
+  "description": "Mermaid diagrams in Claude Code's replies drawn as inline terminal images.",
+  "owner": { "name": "yssk94" },
   "plugins": [
     {
       "name": "herdr-mermaid",
-      "description": "Render mermaid diagrams from Claude Code's output over their own code blocks inside a herdr pane.",
+      "description": "Draw the mermaid diagrams in Claude Code's replies as inline images in the terminal.",
       "source": "./",
       "category": "productivity"
     }

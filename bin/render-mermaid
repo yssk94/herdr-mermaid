@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""render-mermaid: mermaid source on stdin -> {"png": base64, "width": css_px, "height": css_px} on stdout.
+
+Renders with the bundled mermaid.min.js in headless Chrome. Results are cached by source in
+~/.cache/herdr-mermaid/, so a diagram already drawn once (this session or an earlier one)
+returns without starting Chrome. Exit 1 with the reason on stderr when the diagram fails.
+"""
+import base64, hashlib, json, os, select, shutil, struct, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MERMAID_JS = os.path.join(ROOT, "vendor", "mermaid.min.js")
+CACHE = os.path.expanduser("~/.cache/herdr-mermaid")
+BG = "#16161c"                   # matches the dark theme page background
+PAD = 16
+SCALE = 2                        # device pixels per CSS pixel: sharp on HiDPI panes
+MAX_PNG = 2 * 1024 * 1024        # Claude Code draws no inline PNG larger than this
+
+
+def chrome_path():
+    env = os.environ.get("HERDR_MERMAID_CHROME")
+    if env:
+        return env
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if os.path.exists(mac):
+        return mac
+    raise SystemExit("no Chrome/Chromium on PATH; set HERDR_MERMAID_CHROME")
+
+
+# The source goes in as base64 so no diagram text (a "</script>" in a label included) is ever
+# parsed as markup.
+RENDER_PAGE = """<!doctype html><meta charset="utf-8"><title>pending</title>
+<style>html,body{margin:0;padding:0;background:__BG__}#d{display:inline-block;padding:__PAD__px}</style>
+<div id="d"></div>
+<script src="file://__JS__"></script>
+<script>
+(async () => {
+  try {
+    mermaid.initialize({startOnLoad:false, theme:"dark", securityLevel:"strict",
+      sequence:{useMaxWidth:false}, flowchart:{useMaxWidth:false}});
+    const src = new TextDecoder().decode(Uint8Array.from(atob("__SRC__"), c => c.charCodeAt(0)));
+    const {svg} = await mermaid.render("g", src);
+    document.getElementById("d").innerHTML = svg;
+    const r = document.querySelector("#d svg").getBoundingClientRect();
+    document.title = Math.ceil(r.width) + "x" + Math.ceil(r.height);
+  } catch (e) { document.title = "ERR: " + (e && e.message ? e.message : e); }
+})();
+</script>
+"""
+
+
+class Chrome:
+    """One headless Chrome driven over the DevTools pipe (NUL-terminated JSON both ways)."""
+
+    def __init__(self):
+        to_chrome_r, to_chrome_w = os.pipe()
+        from_chrome_r, from_chrome_w = os.pipe()
+        # Chrome speaks the protocol on fds 3 (in) and 4 (out). subprocess closes every fd not in
+        # pass_fds after preexec_fn, so the pipe ends have to *be* 3 and 4 in this process while
+        # we spawn; whatever sat there before is parked on a dup and put back afterwards.
+        parked = {}
+        for fd, want in ((3, to_chrome_r), (4, from_chrome_w)):
+            try:
+                parked[fd] = os.dup(fd)
+            except OSError:
+                parked[fd] = None
+            os.dup2(want, fd)
+        try:
+            self.proc = subprocess.Popen(
+                [chrome_path(), "--headless", "--disable-gpu", "--hide-scrollbars",
+                 "--remote-debugging-pipe", "about:blank"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                pass_fds=(3, 4))
+        finally:
+            for fd, keep in parked.items():
+                if keep is None:
+                    os.close(fd)
+                else:
+                    os.dup2(keep, fd)
+                    os.close(keep)
+            os.close(to_chrome_r)
+            os.close(from_chrome_w)
+        self.w, self.r = to_chrome_w, from_chrome_r
+        self.msg_id = 0
+        self.buf = b""
+        self.session = None
+        try:
+            target = self.cmd("Target.createTarget", {"url": "about:blank"})["targetId"]
+            self.session = self.cmd("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+            self.cmd("Page.enable")
+            self.cmd("Runtime.enable")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for fd in (self.w, self.r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.proc.kill()
+        self.proc.wait()
+
+    def cmd(self, method, params=None, timeout=30):
+        self.msg_id += 1
+        msg = {"id": self.msg_id, "method": method, "params": params or {}}
+        if self.session and not method.startswith("Target."):
+            msg["sessionId"] = self.session
+        os.write(self.w, json.dumps(msg).encode() + b"\0")
+        deadline = time.time() + timeout
+        while True:
+            while b"\0" not in self.buf:
+                left = deadline - time.time()
+                if left <= 0 or not select.select([self.r], [], [], left)[0]:
+                    raise RuntimeError("chrome did not answer " + method)
+                chunk = os.read(self.r, 1 << 20)
+                if not chunk:
+                    raise RuntimeError("chrome pipe closed")
+                self.buf += chunk
+            raw, self.buf = self.buf.split(b"\0", 1)
+            reply = json.loads(raw)
+            if reply.get("id") == self.msg_id:
+                if "error" in reply:
+                    raise RuntimeError("%s: %s" % (method, reply["error"].get("message")))
+                return reply.get("result", {})
+
+    def eval(self, expression, timeout=30):
+        res = self.cmd("Runtime.evaluate", {"expression": expression, "awaitPromise": True,
+                                            "returnByValue": True}, timeout)
+        if "exceptionDetails" in res:
+            raise RuntimeError("page script failed: " + json.dumps(res["exceptionDetails"])[:300])
+        return res["result"].get("value")
+
+    def render_png(self, src, workdir):
+        """Lay the diagram out at scale 1, then screenshot it at SCALE; returns PNG bytes."""
+        page = os.path.join(workdir, "render-%d.html" % os.getpid())
+        with open(page, "w") as f:
+            f.write(RENDER_PAGE.replace("__BG__", BG).replace("__PAD__", str(PAD))
+                    .replace("__JS__", MERMAID_JS)
+                    .replace("__SRC__", base64.b64encode(src.encode()).decode()))
+        try:
+            self.cmd("Page.navigate", {"url": "file://" + page})
+            title = self.eval("""new Promise((ok, ng) => {
+                const t0 = Date.now();
+                const tick = () => { if (document.title && document.title !== "pending") ok(document.title);
+                                     else if (Date.now() - t0 > 15000) ng(new Error("mermaid timeout"));
+                                     else setTimeout(tick, 20); };
+                tick(); })""")
+        finally:
+            os.unlink(page)
+        if not title or title.startswith("ERR") or "x" not in title:
+            raise RuntimeError("mermaid render failed: " + (title or "no title"))
+        w, h = (int(v) + PAD * 2 for v in title.split("x"))
+        for scale in (SCALE, 1):
+            self.cmd("Emulation.setDeviceMetricsOverride",
+                     {"width": w, "height": h, "deviceScaleFactor": scale, "mobile": False})
+            png = base64.b64decode(self.cmd("Page.captureScreenshot", {"format": "png"}, timeout=60)["data"])
+            if len(png) <= MAX_PNG:
+                return png, scale
+        raise RuntimeError("diagram too large: %d bytes as PNG at 1x" % len(png))
+
+
+def png_size(png):
+    # IHDR is the first chunk: width and height are big-endian u32 at bytes 16..24.
+    return struct.unpack(">II", png[16:24])
+
+
+def main():
+    src = sys.stdin.read().strip("\n")
+    if not src.strip():
+        raise SystemExit("empty mermaid source")
+    os.makedirs(CACHE, exist_ok=True)
+    key = hashlib.sha256("\0".join((src, str(SCALE), BG, str(PAD))).encode()).hexdigest()[:32]
+    # The file name carries the scale it was taken at (1x when SCALE went over MAX_PNG).
+    cached = [(s, os.path.join(CACHE, "%s@%dx.png" % (key, s))) for s in (SCALE, 1)]
+    hit = next(((s, p) for s, p in cached if os.path.exists(p)), None)
+    if hit:
+        scale = hit[0]
+        with open(hit[1], "rb") as f:
+            png = f.read()
+    else:
+        chrome = Chrome()
+        try:
+            png, scale = chrome.render_png(src, CACHE)
+        except RuntimeError as e:
+            raise SystemExit(str(e))
+        finally:
+            chrome.close()
+        path = os.path.join(CACHE, "%s@%dx.png" % (key, scale))
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "wb") as f:
+            f.write(png)
+        os.replace(tmp, path)
+    pw, ph = png_size(png)
+    json.dump({"png": base64.b64encode(png).decode(), "width": pw // scale, "height": ph // scale},
+              sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

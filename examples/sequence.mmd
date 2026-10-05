@@ -1,18 +1,19 @@
 sequenceDiagram
   autonumber
-  actor User
   participant Claude as Claude Code
-  participant Emit as herdr-mermaid emit
-  participant Daemon as herdr-mermaid daemon
-  participant Herdr as herdr
-
-  User->>Claude: ask for a diagram
-  Claude->>Emit: diagram source (.mmd)
-  Emit-->>Claude: padded mermaid block
-  Claude->>User: message ending with the block
-  Daemon->>Daemon: tail the transcript, render with Chrome
-  loop every 50 ms
-    Daemon->>Herdr: pane.read (visible text)
-    Daemon->>Herdr: pane.graphics.stream frame at the block's row
+  participant Mod as herdr-mermaid mod
+  participant Render as bin/render-mermaid
+  participant Chrome as headless Chrome
+  Claude->>Mod: ui.render AssistantMessage (reply text)
+  Mod-->>Claude: text as Markdown, the mermaid block as its source
+  Mod->>Render: mermaid source on stdin
+  alt cached
+    Render-->>Mod: PNG from ~/.cache/herdr-mermaid
+  else new diagram
+    Render->>Chrome: render with mermaid.min.js, screenshot at 2x
+    Chrome-->>Render: PNG
+    Render-->>Mod: {png, width, height}
   end
-  Herdr-->>User: picture drawn over the block
+  Mod->>Claude: state update redraws the message
+  Claude->>Mod: ui.render again
+  Mod-->>Claude: Image in place of the block
