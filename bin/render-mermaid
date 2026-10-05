@@ -70,7 +70,9 @@ class Chrome:
             os.dup2(want, fd)
         try:
             self.proc = subprocess.Popen(
+                # The proxy points at a closed port: the page can load file:// but reach no network.
                 [chrome_path(), "--headless", "--disable-gpu", "--hide-scrollbars",
+                 "--proxy-server=127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
                  "--remote-debugging-pipe", "about:blank"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 pass_fds=(3, 4))
