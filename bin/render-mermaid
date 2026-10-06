@@ -15,7 +15,7 @@ PAD = 16
 SCALE = 2                        # device pixels per CSS pixel: sharp on HiDPI panes
 MAX_PNG = 2 * 1024 * 1024        # Claude Code draws no inline PNG larger than this
 MAX_SIDE = 4096                  # ...nor one with a side longer than this many pixels
-MAX_PIXELS = 7_000_000           # herdr drops a graphics frame over 32 MiB; images travel as RGBA
+MAX_PIXELS = 5_500_000           # herdr sends images as base64 RGBA in a 30 MiB budget: about 5.9M pixels
 
 
 def chrome_path():
