@@ -15,6 +15,7 @@ PAD = 16
 SCALE = 2                        # device pixels per CSS pixel: sharp on HiDPI panes
 MAX_PNG = 2 * 1024 * 1024        # Claude Code draws no inline PNG larger than this
 MAX_SIDE = 4096                  # ...nor one with a side longer than this many pixels
+MAX_PIXELS = 7_000_000           # herdr drops a graphics frame over 32 MiB; images travel as RGBA
 
 
 def chrome_path():
@@ -158,8 +159,9 @@ class Chrome:
         if not title or title.startswith("ERR") or "x" not in title:
             raise RuntimeError("mermaid render failed: " + (title or "no title"))
         w, h = (int(v) + PAD * 2 for v in title.split("x"))
-        # Floored to hundredths so Chrome's rounding of w * scale cannot step past MAX_SIDE.
-        top = min(SCALE, math.floor(MAX_SIDE / max(w, h) * 100) / 100)
+        # Floored to hundredths so Chrome's rounding of w * scale cannot step past the limits.
+        fit = min(MAX_SIDE / max(w, h), math.sqrt(MAX_PIXELS / (w * h)))
+        top = min(SCALE, math.floor(fit * 100) / 100)
         for scale in dict.fromkeys((top, min(top, 1))):
             self.cmd("Emulation.setDeviceMetricsOverride",
                      {"width": w, "height": h, "deviceScaleFactor": scale, "mobile": False})
@@ -179,9 +181,9 @@ def main():
     if not src.strip():
         raise SystemExit("empty mermaid source")
     os.makedirs(CACHE, exist_ok=True)
-    key = hashlib.sha256("\0".join((src, str(SCALE), BG, str(PAD), str(MAX_SIDE))).encode()).hexdigest()[:32]
+    key = hashlib.sha256("\0".join((src, str(SCALE), BG, str(PAD), str(MAX_SIDE), str(MAX_PIXELS))).encode()).hexdigest()[:32]
     # The file name carries the scale it was taken at (below SCALE when the diagram went over
-    # MAX_SIDE or MAX_PNG).
+    # MAX_SIDE, MAX_PIXELS or MAX_PNG).
     hit = next(iter(glob.glob(os.path.join(CACHE, "%s@*x.png" % key))), None)
     if hit:
         scale = float(hit.rsplit("@", 1)[1][:-len("x.png")])

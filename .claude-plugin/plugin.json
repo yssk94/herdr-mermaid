@@ -1,7 +1,7 @@
 {
   "name": "herdr-mermaid",
   "description": "Draw the mermaid diagrams in Claude Code's replies as inline images in the terminal (kitty graphics: Ghostty, kitty, herdr 0.9.2+).",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": { "name": "yu-sasaki" },
   "types": "./types/index.d.ts",
   "keywords": ["herdr", "mermaid", "diagram", "kitty-graphics", "mod"]
