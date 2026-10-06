@@ -5,7 +5,7 @@ Renders with the bundled mermaid.min.js in headless Chrome. Results are cached b
 ~/.cache/herdr-mermaid/, so a diagram already drawn once (this session or an earlier one)
 returns without starting Chrome. Exit 1 with the reason on stderr when the diagram fails.
 """
-import base64, hashlib, json, os, select, shutil, struct, subprocess, sys, time
+import base64, glob, hashlib, json, math, os, select, shutil, struct, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MERMAID_JS = os.path.join(ROOT, "vendor", "mermaid.min.js")
@@ -14,6 +14,7 @@ BG = "#16161c"                   # matches the dark theme page background
 PAD = 16
 SCALE = 2                        # device pixels per CSS pixel: sharp on HiDPI panes
 MAX_PNG = 2 * 1024 * 1024        # Claude Code draws no inline PNG larger than this
+MAX_SIDE = 4096                  # ...nor one with a side longer than this many pixels
 
 
 def chrome_path():
@@ -157,7 +158,9 @@ class Chrome:
         if not title or title.startswith("ERR") or "x" not in title:
             raise RuntimeError("mermaid render failed: " + (title or "no title"))
         w, h = (int(v) + PAD * 2 for v in title.split("x"))
-        for scale in (SCALE, 1):
+        # Floored to hundredths so Chrome's rounding of w * scale cannot step past MAX_SIDE.
+        top = min(SCALE, math.floor(MAX_SIDE / max(w, h) * 100) / 100)
+        for scale in dict.fromkeys((top, min(top, 1))):
             self.cmd("Emulation.setDeviceMetricsOverride",
                      {"width": w, "height": h, "deviceScaleFactor": scale, "mobile": False})
             png = base64.b64decode(self.cmd("Page.captureScreenshot", {"format": "png"}, timeout=60)["data"])
@@ -176,13 +179,13 @@ def main():
     if not src.strip():
         raise SystemExit("empty mermaid source")
     os.makedirs(CACHE, exist_ok=True)
-    key = hashlib.sha256("\0".join((src, str(SCALE), BG, str(PAD))).encode()).hexdigest()[:32]
-    # The file name carries the scale it was taken at (1x when SCALE went over MAX_PNG).
-    cached = [(s, os.path.join(CACHE, "%s@%dx.png" % (key, s))) for s in (SCALE, 1)]
-    hit = next(((s, p) for s, p in cached if os.path.exists(p)), None)
+    key = hashlib.sha256("\0".join((src, str(SCALE), BG, str(PAD), str(MAX_SIDE))).encode()).hexdigest()[:32]
+    # The file name carries the scale it was taken at (below SCALE when the diagram went over
+    # MAX_SIDE or MAX_PNG).
+    hit = next(iter(glob.glob(os.path.join(CACHE, "%s@*x.png" % key))), None)
     if hit:
-        scale = hit[0]
-        with open(hit[1], "rb") as f:
+        scale = float(hit.rsplit("@", 1)[1][:-len("x.png")])
+        with open(hit, "rb") as f:
             png = f.read()
     else:
         chrome = Chrome()
@@ -192,13 +195,13 @@ def main():
             raise SystemExit(str(e))
         finally:
             chrome.close()
-        path = os.path.join(CACHE, "%s@%dx.png" % (key, scale))
+        path = os.path.join(CACHE, "%s@%gx.png" % (key, scale))
         tmp = path + ".%d.tmp" % os.getpid()
         with open(tmp, "wb") as f:
             f.write(png)
         os.replace(tmp, path)
     pw, ph = png_size(png)
-    json.dump({"png": base64.b64encode(png).decode(), "width": pw // scale, "height": ph // scale},
+    json.dump({"png": base64.b64encode(png).decode(), "width": round(pw / scale), "height": round(ph / scale)},
               sys.stdout)
 
 
